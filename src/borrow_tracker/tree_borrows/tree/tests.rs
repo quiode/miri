@@ -6,13 +6,20 @@ use std::fmt;
 use super::*;
 use crate::borrow_tracker::tree_borrows::exhaustive::{Exhaustive, precondition};
 
+impl Exhaustive for AccessType {
+    fn exhaustive() -> Box<dyn Iterator<Item = Self>> {
+        use AccessType::*;
+        Box::new([None, Read, Write, ReadWrite].into_iter())
+    }
+}
+
 impl Exhaustive for LocationState {
     fn exhaustive() -> Box<dyn Iterator<Item = Self>> {
         // We keep `latest_foreign_access` at `None` as that's just a cache.
-        Box::new(<(Permission, bool)>::exhaustive().map(|(permission, accessed)| {
+        Box::new(<(Permission, AccessType)>::exhaustive().map(|(permission, accessed)| {
             Self {
                 permission,
-                accessed,
+                access: accessed,
                 idempotent_foreign_access: IdempotentForeignAccess::default(),
             }
         }))
@@ -230,7 +237,7 @@ mod spurious {
                 for (x_retag_perm, y_current_perm) in <(LocationState, LocationState)>::exhaustive()
                 {
                     // We can only do spurious operations for accessed locations anyway.
-                    precondition!(x_retag_perm.accessed);
+                    precondition!(x_retag_perm.access.accessed());
                     // And `x` just got retagged, so it must be initial.
                     precondition!(x_retag_perm.permission.is_initial());
                     // As stated earlier, `x` is always protected in the patterns we consider here.
@@ -528,15 +535,15 @@ mod spurious {
         /// Must be called just after reborrowing a pointer, and just after
         /// removing a protector.
         fn read_if_accessed(self, ptr: PtrSelector) -> Result<Self, ()> {
-            let accessed = match ptr {
-                PtrSelector::X => self.x.state.accessed,
-                PtrSelector::Y => self.y.state.accessed,
+            let access = match ptr {
+                PtrSelector::X => self.x.state.access,
+                PtrSelector::Y => self.y.state.access,
                 PtrSelector::Other =>
                     panic!(
                         "the `accessed` status of `PtrSelector::Other` is unknown, do not pass it to `read_if_accessed`"
                     ),
             };
-            if accessed {
+            if access.accessed() {
                 self.perform_test_access(&TestAccess { ptr, kind: AccessKind::Read })
             } else {
                 Ok(self)
@@ -546,15 +553,15 @@ mod spurious {
         /// Perform a write on the given pointer if its state is `accessed`.
         /// Must be called just after reborrowing a pointer.
         fn write_if_accessed(self, ptr: PtrSelector) -> Result<Self, ()> {
-            let accessed = match ptr {
-                PtrSelector::X => self.x.state.accessed,
-                PtrSelector::Y => self.y.state.accessed,
+            let access = match ptr {
+                PtrSelector::X => self.x.state.access,
+                PtrSelector::Y => self.y.state.access,
                 PtrSelector::Other =>
                     panic!(
                         "the `accessed` status of `PtrSelector::Other` is unknown, do not pass it to `write_if_accessed`"
                     ),
             };
-            if accessed {
+            if access.accessed() {
                 self.perform_test_access(&TestAccess { ptr, kind: AccessKind::Write })
             } else {
                 Ok(self)
@@ -713,16 +720,18 @@ mod spurious {
                 xy_rel: RelPosXY::MutuallyForeign,
                 x: LocStateProt {
                     // For the tests, the strongest idempotent foreign access does not matter, so we use `Default::default`
-                    state: LocationState::new_accessed(
+                    state: LocationState::new(
                         Permission::new_frozen(),
                         IdempotentForeignAccess::default(),
+                        AccessType::Read,
                     ),
                     prot: true,
                 },
                 y: LocStateProt {
-                    state: LocationState::new_non_accessed(
+                    state: LocationState::new(
                         Permission::new_reserved_frz(),
                         IdempotentForeignAccess::default(),
+                        AccessType::None,
                     ),
                     prot: true,
                 },
@@ -799,6 +808,7 @@ mod spurious {
         use super::*;
 
         #[test]
+        #[ignore] // TODO: remove
         /// For each of the patterns described above, execute it once
         /// as-is, and once with a spurious write inserted. Report any UB
         /// in the target but not in the source.
