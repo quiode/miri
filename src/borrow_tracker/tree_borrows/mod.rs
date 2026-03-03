@@ -7,7 +7,7 @@ use self::foreign_access_skipping::IdempotentForeignAccess;
 use self::tree::LocationState;
 use crate::borrow_tracker::tree_borrows::tree::AccessType;
 use crate::borrow_tracker::{AccessKind, GlobalState, GlobalStateInner, ProtectorKind};
-use crate::concurrency::data_race::NaReadType;
+use crate::concurrency::data_race::{NaReadType, NaWriteType};
 use crate::*;
 
 pub mod diagnostics;
@@ -166,9 +166,13 @@ impl<'tcx> NewPermission {
         // Everything except for `Cell` gets an initial read.
         let initial_read = |perm: &Permission| !perm.is_cell();
 
-        // Every mutable reference that gets an initial read also gets an initial write.
-        let initial_write =
-            |perm: &Permission| Some(Mutability::Mut) == ref_mutability && initial_read(perm);
+        // Every explicit mutable reference that gets an initial read also gets an initial write.
+        // Thus implicit mutable references (Two Phase borrowing) and Raw pointers are excluded
+        let initial_write = |perm: &Permission| {
+            Some(Mutability::Mut) == ref_mutability
+                && initial_read(perm)
+                && matches!(retag_kind, RetagKind::Default | RetagKind::FnEntry)
+        };
 
         Some(NewPermission {
             freeze_perm,
@@ -332,9 +336,6 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             perms_map
         };
 
-        let alloc_extra = this.get_alloc_extra(alloc_id)?;
-        let mut tree_borrows = alloc_extra.borrow_tracker_tb().borrow_mut();
-
         for (perm_range, perm) in inside_perms.iter_all() {
             let access = perm.access();
             if matches!(access, AccessType::Read | AccessType::ReadWrite) {
@@ -344,6 +345,9 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     start: Size::from_bytes(perm_range.start) + base_offset,
                     size: Size::from_bytes(perm_range.end - perm_range.start),
                 };
+
+                let alloc_extra = this.get_alloc_extra(alloc_id)?;
+                let mut tree_borrows = alloc_extra.borrow_tracker_tb().borrow_mut();
 
                 tree_borrows.perform_access(
                     parent_prov,
@@ -370,9 +374,46 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
 
             if matches!(access, AccessType::Write | AccessType::ReadWrite) {
-                // TODO: implement write access
+                // Some reborrows incur a write access to the parent.
+                // Adjust range to be relative to allocation start (rather than to `place`).
+                let range_in_alloc = AllocRange {
+                    start: Size::from_bytes(perm_range.start) + base_offset,
+                    size: Size::from_bytes(perm_range.end - perm_range.start),
+                };
+
+                let (alloc_extra, machine) = this.get_alloc_extra_mut(alloc_id)?;
+                let mut tree_borrows = alloc_extra.borrow_tracker_tb().borrow_mut();
+
+                tree_borrows.perform_access(
+                    parent_prov,
+                    range_in_alloc,
+                    AccessKind::Write,
+                    diagnostics::AccessCause::Reborrow,
+                    machine.borrow_tracker.as_ref().unwrap(),
+                    alloc_id,
+                    machine.current_user_relevant_span(),
+                )?;
+
+                // don't need it anymore
+                drop(tree_borrows);
+
+                // Also inform the data race model (but only if any bytes are actually affected).
+                if range_in_alloc.size.bytes() > 0 {
+                    if let Some(data_race) = alloc_extra.data_race.as_vclocks_mut() {
+                        data_race.write_non_atomic(
+                            alloc_id,
+                            range_in_alloc,
+                            NaWriteType::Retag,
+                            Some(place.layout.ty),
+                            machine,
+                        )?
+                    }
+                }
             }
         }
+
+        let mut tree_borrows = this.get_alloc_extra(alloc_id)?.borrow_tracker_tb().borrow_mut();
+
         // Record the parent-child pair in the tree.
         tree_borrows.new_child(
             base_offset,

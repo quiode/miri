@@ -193,7 +193,7 @@ fn protected_enforces_noalias() {
 ///                           read/write x/y/other
 ///                        or retag y
 ///                        or unprotect y
-///     <spurious write x>      ||
+///     <spurious operation x>      ||
 ///                      arbitrary code
 ///                           read/write x/y/other
 ///                        or retag y
@@ -228,31 +228,6 @@ mod spurious {
         /// Whether `y` starts with a protector.
         /// Might change if the opaque code contains any `ret y`.
         y_protected: bool,
-    }
-
-    impl Exhaustive for Pattern {
-        fn exhaustive() -> Box<dyn Iterator<Item = Self>> {
-            let mut v = Vec::new();
-            for xy_rel in RelPosXY::exhaustive() {
-                for (x_retag_perm, y_current_perm) in <(LocationState, LocationState)>::exhaustive()
-                {
-                    // We can only do spurious operations for accessed locations anyway.
-                    precondition!(x_retag_perm.access.accessed());
-                    // And `x` just got retagged, so it must be initial.
-                    precondition!(x_retag_perm.permission.is_initial());
-                    // As stated earlier, `x` is always protected in the patterns we consider here.
-                    precondition!(x_retag_perm.compatible_with_protector());
-                    for y_protected in bool::exhaustive() {
-                        // Finally `y` that is optionally protected must have a compatible permission.
-                        if y_protected {
-                            precondition!(y_current_perm.compatible_with_protector());
-                        }
-                        v.push(Pattern { xy_rel, x_retag_perm, y_current_perm, y_protected });
-                    }
-                }
-            }
-            Box::new(v.into_iter())
-        }
     }
 
     impl fmt::Display for Pattern {
@@ -712,6 +687,59 @@ mod spurious {
     mod spurious_read {
         use super::*;
 
+        #[derive(Clone, Debug)]
+        struct ReadPattern {
+            pattern: Pattern,
+        }
+
+        impl ReadPattern {
+            fn initial_state(&self) -> Result<LocStateProtPair, ()> {
+                self.pattern.initial_state(AccessKind::Read)
+            }
+        }
+
+        impl fmt::Display for ReadPattern {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.pattern.fmt(f)
+            }
+        }
+
+        impl Exhaustive for ReadPattern {
+            fn exhaustive() -> Box<dyn Iterator<Item = Self>> {
+                let mut v = Vec::new();
+                for xy_rel in RelPosXY::exhaustive() {
+                    for (x_retag_perm, y_current_perm) in
+                        <(LocationState, LocationState)>::exhaustive()
+                    {
+                        // Spurious reads can be done for any kind of accessed location, except writes.
+                        precondition!(
+                            x_retag_perm.access.accessed()
+                                && x_retag_perm.access != AccessType::Write
+                        );
+                        // And `x` just got retagged, so it must be initial.
+                        precondition!(x_retag_perm.permission.is_initial());
+                        // As stated earlier, `x` is always protected in the patterns we consider here.
+                        precondition!(x_retag_perm.compatible_with_protector());
+                        for y_protected in bool::exhaustive() {
+                            // Finally `y` that is optionally protected must have a compatible permission.
+                            if y_protected {
+                                precondition!(y_current_perm.compatible_with_protector());
+                            }
+                            v.push(ReadPattern {
+                                pattern: Pattern {
+                                    xy_rel,
+                                    x_retag_perm,
+                                    y_current_perm,
+                                    y_protected,
+                                },
+                            });
+                        }
+                    }
+                }
+                Box::new(v.into_iter())
+            }
+        }
+
         #[test]
         // `Reserved { conflicted: false }` and `Reserved { conflicted: true }` are properly indistinguishable
         // under the conditions where we want to insert a spurious read.
@@ -750,8 +778,8 @@ mod spurious {
         fn test_all_patterns() {
             let mut ok = 0;
             let mut err = 0;
-            for pat in Pattern::exhaustive() {
-                let Ok(initial_source) = pat.initial_state(AccessKind::Read) else {
+            for pat in ReadPattern::exhaustive() {
+                let Ok(initial_source) = pat.initial_state() else {
                     // Failed to retag `x` in the source (e.g. `y` was protected Unique)
                     continue;
                 };
@@ -807,16 +835,68 @@ mod spurious {
     mod spurious_write {
         use super::*;
 
+        #[derive(Clone, Debug)]
+        struct WritePattern {
+            pattern: Pattern,
+        }
+
+        impl WritePattern {
+            fn initial_state(&self) -> Result<LocStateProtPair, ()> {
+                self.pattern.initial_state(AccessKind::Write)
+            }
+        }
+
+        impl fmt::Display for WritePattern {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.pattern.fmt(f)
+            }
+        }
+
+        impl Exhaustive for WritePattern {
+            fn exhaustive() -> Box<dyn Iterator<Item = Self>> {
+                let mut v = Vec::new();
+                for xy_rel in RelPosXY::exhaustive() {
+                    for (x_retag_perm, y_current_perm) in
+                        <(LocationState, LocationState)>::exhaustive()
+                    {
+                        // Spurious writes only work for locations with write access.
+                        precondition!(matches!(
+                            x_retag_perm.access,
+                            AccessType::Write | AccessType::ReadWrite
+                        ));
+                        // And `x` just got retagged, so it must be an initial mutable variable.
+                        precondition!(x_retag_perm.permission.is_reserved_frz());
+                        // As stated earlier, `x` is always protected in the patterns we consider here.
+                        precondition!(x_retag_perm.compatible_with_protector());
+                        for y_protected in bool::exhaustive() {
+                            // Finally `y` that is optionally protected must have a compatible permission.
+                            if y_protected {
+                                precondition!(y_current_perm.compatible_with_protector());
+                            }
+                            v.push(WritePattern {
+                                pattern: Pattern {
+                                    xy_rel,
+                                    x_retag_perm,
+                                    y_current_perm,
+                                    y_protected,
+                                },
+                            });
+                        }
+                    }
+                }
+                Box::new(v.into_iter())
+            }
+        }
+
         #[test]
-        #[ignore] // TODO: remove
         /// For each of the patterns described above, execute it once
         /// as-is, and once with a spurious write inserted. Report any UB
         /// in the target but not in the source.
         fn test_all_patterns() {
             let mut ok = 0;
             let mut err = 0;
-            for pat in Pattern::exhaustive() {
-                let Ok(initial_source) = pat.initial_state(AccessKind::Write) else {
+            for pat in WritePattern::exhaustive() {
+                let Ok(initial_source) = pat.initial_state() else {
                     // Failed to retag `x` in the source (e.g. `y` was protected Unique)
                     continue;
                 };
