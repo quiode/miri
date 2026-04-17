@@ -11,5 +11,7 @@ match_arm_leading_pipes = "Preserve"
 
 ignore = [
     # This file is copy-pasted from the tracing_chrome crate and should remain like the original.
-    "src/bin/log/tracing_chrome.rs"
+    "src/bin/log/tracing_chrome.rs",
+    # Ignore project local cargo and rustup directories
+    "etc/nix-dev-shell/.nix",
 ]
